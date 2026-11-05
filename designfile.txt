@@ -1,0 +1,394 @@
+`timescale 1ns / 1ps
+// =============================================================================
+//  Nexys A7  -  Real-time PDM microphone -> noise-reduction DSP -> PWM audio
+//
+//  Signal chain (everything runs from the single 100 MHz clock, no derived
+//  clocks):
+//
+//   PDM mic --> 4th-order CIC decimator (/64) --> DC-blocking HPF (~100 Hz)
+//           --> 50 Hz notch --> digital gain --> envelope noise gate
+//           --> first-order noise-shaped 8-bit PWM --> AUD_PWM (3.5 mm jack)
+//
+//  PDM clock       : 100 MHz / 32  = 3.125 MHz   (ADMP421 range: 1.0 - 3.3 MHz)
+//  Sample rate     : 3.125 MHz / 64 = 48.828125 kHz
+//  Mic data edge   : M_LRSEL = 0  -> data is valid at the RISING edge of M_CLK
+//                    (driven after the falling edge, released shortly after
+//                    the rising edge).  Data is therefore sampled just BEFORE
+//                    the rising edge of M_CLK.
+//
+//  Tuning knobs (localparams just below):
+//    GAIN_LOG2   : digital gain = 2^GAIN_LOG2 (4 -> x16 = +24 dB)
+//    HP_ALPHA    : high-pass coefficient (Q15)
+//    HOLD_SAMPLES: how long the gate stays open after the signal drops
+//  SW[3:0] = noise-gate threshold, 0 = gate disabled, n = n*100 (16-bit scale)
+// =============================================================================
+module nexys_audio_top (
+    input  wire       clk_100mhz,
+    input  wire       rst_btn_n,
+    input  wire [3:0] sw,
+    input  wire       m_data,
+    output reg        m_clk,
+    output wire       m_lrsel,
+    output wire       AUD_PWM,
+    output wire       AUD_SD
+);
+
+    // ------------------------------------------------------------------
+    // Tunable parameters
+    // ------------------------------------------------------------------
+    localparam integer GAIN_LOG2    = 4;        // digital gain exponent
+    localparam [15:0]  HP_ALPHA     = 16'd32349;// exp(-2*pi*100/Fs) in Q15 -> 100 Hz
+    localparam integer HOLD_SAMPLES = 2400;     // gate hold time (~50 ms)
+    localparam integer GATE_UP_STEP = 16;       // gate opens in 16 samples
+
+    // 50 Hz notch, Fs = 48.828125 kHz, Q30 coefficients
+    //   y[n] = B0*x[n] + B1*x[n-1] + B2*x[n-2] - A1*y[n-1] - A2*y[n-2]
+    // (the feedback coefficients are stored already negated)
+    localparam signed [31:0] C_B0  =  32'sd1073396516;
+    localparam signed [31:0] C_B1  = -32'sd2146748597;
+    localparam signed [31:0] C_B2  =  32'sd1073396516;
+    localparam signed [31:0] C_NA1 =  32'sd2146748597;  // -A1
+    localparam signed [31:0] C_NA2 = -32'sd1073051207;  // -A2
+
+    // ------------------------------------------------------------------
+    // 0. Reset and input synchronisers
+    // ------------------------------------------------------------------
+    // rst_btn_n is active low.  The shift register starts at 0, so the design
+    // is also held in reset for the first three clocks after configuration.
+    reg [2:0] rst_sr = 3'b000;
+    always @(posedge clk_100mhz) rst_sr <= {rst_sr[1:0], rst_btn_n};
+    wire rst = ~rst_sr[2];
+
+    reg [3:0] sw_s1 = 4'd0, sw_s2 = 4'd0;
+    always @(posedge clk_100mhz) begin
+        sw_s1 <= sw;
+        sw_s2 <= sw_s1;
+    end
+
+    reg m_data_s1 = 1'b0, m_data_s2 = 1'b0;
+    always @(posedge clk_100mhz) begin
+        m_data_s1 <= m_data;
+        m_data_s2 <= m_data_s1;
+    end
+
+    assign m_lrsel = 1'b0;   // data valid on the rising edge of M_CLK
+    assign AUD_SD  = 1'b1;   // amplifier enabled (drive high to un-mute)
+
+    // ------------------------------------------------------------------
+    // 1. PDM clock generation (free running, not affected by the reset
+    //    button so the microphone never drops into sleep mode)
+    // ------------------------------------------------------------------
+    reg [3:0] pdm_div = 4'd0;
+    initial m_clk = 1'b0;
+    always @(posedge clk_100mhz) begin
+        pdm_div <= pdm_div + 1'b1;          // 0..15, wraps by itself
+        if (pdm_div == 4'd15)
+            m_clk <= ~m_clk;
+    end
+
+    // One-cycle enable, asserted in the cycle right after M_CLK rises
+    // (pdm_div == 0 && m_clk == 1).  The two-flop synchroniser delays the pin
+    // by two clocks, so m_data_s2 read on the following edge holds the pin value
+    // from one system clock (10 ns) BEFORE the M_CLK rising edge - exactly when
+    // the microphone data is stable and valid.
+    wire pdm_en = (pdm_div == 4'd0) && m_clk;
+
+    // ------------------------------------------------------------------
+    // 2. 4th-order CIC decimator, R = 64   (replaces the 64-bit box filter)
+    //    Gain = 64^4 = 2^24, output width = 25 bits.
+    // ------------------------------------------------------------------
+    localparam CW = 25;
+    reg [CW-1:0] ig1 = 0, ig2 = 0, ig3 = 0, ig4 = 0;   // integrators (3.125 MHz)
+    reg [5:0]    dec_cnt = 6'd0;
+    reg [CW-1:0] cs0 = 0, cs1 = 0, cs2 = 0, cs3 = 0, cs4 = 0;  // comb pipeline
+    reg [CW-1:0] cd1 = 0, cd2 = 0, cd3 = 0, cd4 = 0;           // comb delays
+    reg          cv0 = 0, cv1 = 0, cv2 = 0, cv3 = 0, cv4 = 0;
+
+    wire dec_tick = pdm_en && (dec_cnt == 6'd63);
+
+    always @(posedge clk_100mhz) begin
+        if (rst) begin
+            ig1 <= 0; ig2 <= 0; ig3 <= 0; ig4 <= 0;
+            dec_cnt <= 6'd0;
+            cs0 <= 0; cs1 <= 0; cs2 <= 0; cs3 <= 0; cs4 <= 0;
+            cd1 <= 0; cd2 <= 0; cd3 <= 0; cd4 <= 0;
+            cv0 <= 0; cv1 <= 0; cv2 <= 0; cv3 <= 0; cv4 <= 0;
+        end else begin
+            if (pdm_en) begin
+                ig1 <= ig1 + {{(CW-1){1'b0}}, m_data_s2};
+                ig2 <= ig2 + ig1;
+                ig3 <= ig3 + ig2;
+                ig4 <= ig4 + ig3;
+                dec_cnt <= dec_cnt + 1'b1;          // wraps 63 -> 0
+            end
+            // comb section: one stage per clock, run at the output rate
+            cv0 <= dec_tick;
+            if (dec_tick) cs0 <= ig4;
+            cv1 <= cv0;
+            if (cv0) begin cs1 <= cs0 - cd1; cd1 <= cs0; end
+            cv2 <= cv1;
+            if (cv1) begin cs2 <= cs1 - cd2; cd2 <= cs1; end
+            cv3 <= cv2;
+            if (cv2) begin cs3 <= cs2 - cd3; cd3 <= cs2; end
+            cv4 <= cv3;
+            if (cv3) begin cs4 <= cs3 - cd4; cd4 <= cs3; end
+        end
+    end
+
+    // cs4 is 0 .. 2^24 (ones-density x 2^24).  Remove the 50 % offset and scale
+    // to 20-bit signed with full scale = +/-2^17.
+    wire signed [25:0] cic_centred =
+        $signed({1'b0, cs4}) - 26'sd8388608 + 26'sd32;      // -2^23, +0.5 LSB
+    reg signed [19:0] cic_sample = 20'sd0;
+    reg               cic_valid  = 1'b0;
+    always @(posedge clk_100mhz) begin
+        if (rst) begin
+            cic_sample <= 20'sd0;
+            cic_valid  <= 1'b0;
+        end else begin
+            cic_valid <= cv4;
+            if (cv4) cic_sample <= cic_centred >>> 6;
+        end
+    end
+
+    // ------------------------------------------------------------------
+    // 3. Shared bit-serial multiply-accumulate engine + DSP sequencer
+    //    One sample arrives every ~2048 clocks, so a single serial multiplier
+    //    is used for the high-pass filter (1 multiply) and the notch (5
+    //    multiplies).  This closes timing at 100 MHz without wide DSP chains.
+    //    The IIR state is kept with extra fractional bits so truncation noise
+    //    is not amplified by the high-Q notch poles.
+    // ------------------------------------------------------------------
+    localparam [2:0] S_IDLE = 3'd0, S_HP_LOAD = 3'd1, S_MUL = 3'd2,
+                     S_HP_DONE = 3'd3, S_N_LOAD = 3'd4, S_N_DONE = 3'd5,
+                     S_N_FIN = 3'd6;
+
+    reg [2:0]  st = S_IDLE;
+    reg        phase_notch = 1'b0;
+    reg [2:0]  tap = 3'd0;
+    reg [5:0]  bitn = 6'd0;
+    reg [31:0] eng_c = 32'd0;                 // multiplier (shifted right)
+    reg signed [71:0] eng_m   = 72'sd0;       // multiplicand (shifted left)
+    reg signed [71:0] eng_acc = 72'sd0;
+
+    // high-pass state: y in Q8 (20+8 bits)
+    reg signed [19:0] hp_x1  = 20'sd0;
+    reg signed [27:0] hp_y   = 28'sd0;
+    reg signed [19:0] hp_out = 20'sd0;
+    // notch state: x in Q0, y in Q16 (20+16 bits)
+    reg signed [19:0] nx1 = 20'sd0, nx2 = 20'sd0;
+    reg signed [35:0] ny1 = 36'sd0, ny2 = 36'sd0;
+    reg signed [19:0] nt_sample = 20'sd0;
+    reg               nt_valid  = 1'b0;
+
+    // ---- high-pass:  y[n] = alpha * (y[n-1] + x[n] - x[n-1]) -------------
+    wire signed [20:0] hp_xdiff = cic_sample - hp_x1;
+    wire signed [29:0] hp_d     = hp_y + (hp_xdiff <<< 8);
+    wire signed [71:0] hp_round = (eng_acc + 72'sd16384) >>> 15;
+    wire signed [27:0] hp_y_new =
+        (hp_round >  72'sd134217727)  ? 28'sh7FFFFFF :
+        (hp_round < -72'sd134217728)  ? 28'sh8000000 : hp_round[27:0];
+    wire signed [19:0] hp_out_w = hp_y_new >>> 8;
+
+    // ---- notch tap selection ---------------------------------------------
+    reg signed [31:0] tap_c;
+    reg signed [35:0] tap_d;
+    always @* begin
+        case (tap)
+            3'd0:    begin tap_c = C_B0;  tap_d = {hp_out, 16'd0}; end
+            3'd1:    begin tap_c = C_B1;  tap_d = {nx1,    16'd0}; end
+            3'd2:    begin tap_c = C_B2;  tap_d = {nx2,    16'd0}; end
+            3'd3:    begin tap_c = C_NA1; tap_d = ny1;             end
+            default: begin tap_c = C_NA2; tap_d = ny2;             end
+        endcase
+    end
+
+    wire signed [71:0] ny_round = (eng_acc + 72'sd536870912) >>> 30;
+    wire signed [35:0] ny_sat =
+        (ny_round >  72'sd34359738367) ? 36'sh7FFFFFFFF :
+        (ny_round < -72'sd34359738368) ? 36'sh800000000 : ny_round[35:0];
+    reg  signed [35:0] ny_new = 36'sd0;      // saturated result, registered (timing)
+    wire signed [36:0] nt_r  = ($signed({ny_new[35], ny_new}) + 37'sd32768) >>> 16;
+    wire signed [19:0] nt_out = (nt_r > 37'sd524287) ? 20'sh7FFFF : nt_r[19:0];
+
+    always @(posedge clk_100mhz) begin
+        nt_valid <= 1'b0;
+        if (rst) begin
+            st <= S_IDLE; phase_notch <= 1'b0; tap <= 3'd0; bitn <= 6'd0;
+            eng_c <= 32'd0; eng_m <= 72'sd0; eng_acc <= 72'sd0;
+            hp_x1 <= 20'sd0; hp_y <= 28'sd0; hp_out <= 20'sd0;
+            nx1 <= 20'sd0; nx2 <= 20'sd0; ny1 <= 36'sd0; ny2 <= 36'sd0;
+            ny_new <= 36'sd0; nt_sample <= 20'sd0;
+        end else begin
+            case (st)
+                S_IDLE: if (cic_valid) begin
+                    phase_notch <= 1'b0;
+                    st <= S_HP_LOAD;
+                end
+
+                S_HP_LOAD: begin
+                    eng_c   <= {16'd0, HP_ALPHA};
+                    eng_m   <= {{42{hp_d[29]}}, hp_d};
+                    eng_acc <= 72'sd0;
+                    bitn    <= 6'd0;
+                    st      <= S_MUL;
+                end
+
+                // 32 cycles of shift-and-add; bit 31 has negative weight
+                S_MUL: begin
+                    if (eng_c[0]) begin
+                        if (bitn == 6'd31) eng_acc <= eng_acc - eng_m;
+                        else               eng_acc <= eng_acc + eng_m;
+                    end
+                    eng_c <= {1'b0, eng_c[31:1]};
+                    eng_m <= eng_m <<< 1;
+                    bitn  <= bitn + 1'b1;
+                    if (bitn == 6'd31) begin
+                        if (!phase_notch)  st <= S_HP_DONE;
+                        else if (tap == 3'd4) st <= S_N_DONE;
+                        else begin tap <= tap + 1'b1; st <= S_N_LOAD; end
+                    end
+                end
+
+                S_HP_DONE: begin
+                    hp_y   <= hp_y_new;
+                    hp_x1  <= cic_sample;
+                    hp_out <= hp_out_w;
+                    phase_notch <= 1'b1;
+                    tap     <= 3'd0;
+                    eng_acc <= 72'sd0;
+                    st      <= S_N_LOAD;
+                end
+
+                S_N_LOAD: begin
+                    eng_c <= tap_c;
+                    eng_m <= {{36{tap_d[35]}}, tap_d};
+                    bitn  <= 6'd0;
+                    st    <= S_MUL;
+                end
+
+                S_N_DONE: begin                 // round + saturate the accumulator
+                    ny_new <= ny_sat;
+                    st <= S_N_FIN;
+                end
+
+                S_N_FIN: begin                  // update filter state, emit sample
+                    nx2 <= nx1;  nx1 <= hp_out;
+                    ny2 <= ny1;  ny1 <= ny_new;
+                    nt_sample <= nt_out;
+                    nt_valid  <= 1'b1;
+                    st <= S_IDLE;
+                end
+
+                default: st <= S_IDLE;
+            endcase
+        end
+    end
+
+    // ------------------------------------------------------------------
+    // 4. Digital gain  (20-bit, full scale +/-2^17  ->  16-bit, saturated)
+    // ------------------------------------------------------------------
+    wire signed [27:0] g_shift = ($signed(nt_sample) <<< GAIN_LOG2) >>> 2;
+    wire signed [15:0] g_sat =
+        (g_shift >  28'sd32767)  ? 16'sh7FFF :
+        (g_shift < -28'sd32768)  ? 16'sh8000 : g_shift[15:0];
+
+    // ------------------------------------------------------------------
+    // 5. Envelope-based noise gate with hold and smooth gain ramp
+    //    (the old per-sample compare chopped the waveform = distortion)
+    // ------------------------------------------------------------------
+    wire [15:0] threshold = {12'd0, sw_s2} * 16'd100;
+
+    reg signed [15:0] g16 = 16'sd0, g16_d = 16'sd0, g16_dd = 16'sd0;
+    reg        v_g = 1'b0, v_a = 1'b0, v_e = 1'b0, v_m = 1'b0, v_o = 1'b0;
+    reg [15:0] abs16 = 16'd0;
+    reg [15:0] env   = 16'd0;
+    reg [12:0] hold  = 13'd0;
+    reg [8:0]  gate_gain = 9'd0;            // 0 .. 256
+    reg signed [25:0] prod = 26'sd0;
+    reg signed [15:0] gated = 16'sd0;
+
+    wire [15:0] env_decay = env - (env >> 8) - {15'd0, (env != 16'd0)};
+    wire [15:0] env_nxt   = (abs16 > env) ? abs16 : env_decay;
+    wire        thr_zero  = (threshold == 16'd0);
+    wire        over_thr  = (env_nxt >= threshold);
+    wire        gate_open = thr_zero || over_thr || (hold != 13'd0);
+
+    always @(posedge clk_100mhz) begin
+        if (rst) begin
+            g16 <= 16'sd0; g16_d <= 16'sd0; g16_dd <= 16'sd0;
+            v_g <= 1'b0; v_a <= 1'b0; v_e <= 1'b0; v_m <= 1'b0; v_o <= 1'b0;
+            abs16 <= 16'd0; env <= 16'd0; hold <= 13'd0; gate_gain <= 9'd0;
+            prod <= 26'sd0; gated <= 16'sd0;
+        end else begin
+            // stage G: gain
+            v_g <= nt_valid;
+            if (nt_valid) g16 <= g_sat;
+            // stage A: magnitude
+            v_a <= v_g;
+            if (v_g) begin
+                g16_d <= g16;
+                abs16 <= g16[15] ? (~g16 + 16'd1) : g16;
+            end
+            // stage E: envelope, hold, gain ramp
+            v_e <= v_a;
+            if (v_a) begin
+                g16_dd <= g16_d;
+                env    <= env_nxt;
+                if (over_thr)            hold <= HOLD_SAMPLES;
+                else if (hold != 13'd0)  hold <= hold - 1'b1;
+                if (gate_open)
+                    gate_gain <= (gate_gain >= (9'd256 - GATE_UP_STEP)) ?
+                                  9'd256 : gate_gain + GATE_UP_STEP;
+                else if (gate_gain != 9'd0)
+                    gate_gain <= gate_gain - 1'b1;
+            end
+            // stage M: apply gate gain
+            v_m <= v_e;
+            if (v_e) prod <= $signed(g16_dd) * $signed({1'b0, gate_gain});
+            // stage O: scale back to 16 bit
+            v_o <= v_m;
+            if (v_m) gated <= prod >>> 8;
+        end
+    end
+
+    // ------------------------------------------------------------------
+    // 6. PWM audio output
+    //    8-bit PWM at 100 MHz / 256 = 390.625 kHz.  A first-order error
+    //    feedback (noise-shaping) quantiser keeps the low 8 bits of every
+    //    16-bit sample, giving ~12-bit resolution in the audio band.
+    //    The board's output is open-drain: logic 1 = high-Z (pulled up),
+    //    logic 0 = drive low.
+    // ------------------------------------------------------------------
+    reg [7:0]  pwm_cnt  = 8'd0;
+    reg [7:0]  pwm_duty = 8'd128;
+    reg [7:0]  duty_pend = 8'd128;
+    reg [7:0]  dither_err = 8'd0;
+    reg        pwm_q = 1'b0;
+
+    wire [15:0] pcm_u = {~gated[15], gated[14:0]};          // signed -> offset binary
+    wire [16:0] dsum  = {1'b0, pcm_u} + {9'd0, dither_err};
+
+    always @(posedge clk_100mhz) begin
+        if (rst) begin
+            pwm_cnt <= 8'd0; pwm_duty <= 8'd128; duty_pend <= 8'd128;
+            dither_err <= 8'd0; pwm_q <= 1'b0;
+        end else begin
+            pwm_cnt <= pwm_cnt + 1'b1;
+            if (v_o) begin
+                if (dsum[16]) begin
+                    duty_pend  <= 8'hFF;
+                    dither_err <= 8'd0;
+                end else begin
+                    duty_pend  <= dsum[15:8];
+                    dither_err <= dsum[7:0];
+                end
+            end
+            if (pwm_cnt == 8'hFF) pwm_duty <= duty_pend;   // update on PWM period boundary
+            pwm_q <= (pwm_cnt < pwm_duty);
+        end
+    end
+
+    assign AUD_PWM = pwm_q ? 1'bz : 1'b0;
+
+endmodule

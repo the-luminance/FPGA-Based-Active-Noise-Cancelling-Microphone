@@ -1,0 +1,408 @@
+function Street_Noise_Removal_App
+% STREET_NOISE_REMOVAL_APP  (v2 - speech-oriented)
+% Self-contained MATLAB GUI for developing the FPGA noise-cancelling chain.
+%
+%   Pipeline (all causal, ~32 ms algorithmic latency, designed for 16 kHz):
+%     1. High-pass biquad (80 Hz) + mains-hum notch biquads (50/100 Hz)
+%     2. STFT  : 512-pt sqrt-Hann, 75 % overlap (hop = 128 = 8 ms)
+%     3. Noise PSD tracking per bin (MCRA: minimum-controlled recursive averaging)
+%     4. A-priori SNR by Decision-Directed estimation (Ephraim-Malah)
+%     5. MMSE log-spectral-amplitude gain, weighted by speech-presence
+%        probability (OM-LSA style) and floored at -MaxAtten dB
+%     6. Overlap-add resynthesis (noisy phase)
+%
+%   Requires: MATLAB R2016b+ (movmin, implicit expansion). Signal Processing
+%   Toolbox is only used for resample() when the file is not 16 kHz.
+
+    % ---------- UI Layout ----------
+    fig = uifigure('Name','Street Noise Removal (HPF + Notch + MCRA / MMSE-LSA)', ...
+        'Position',[100 100 1050 720], ...
+        'Color',[0.96 0.97 0.98]);
+
+    root = uigridlayout(fig,[5 1]);
+    root.RowHeight = {65, 75, '1x', 90, 35};
+    root.Padding = [18 14 18 12];
+    root.RowSpacing = 10;
+
+    titleLabel = uilabel(root, ...
+        'Text','Filter Quality Check', ...
+        'FontSize',19,'FontWeight','bold', ...
+        'HorizontalAlignment','center');
+    titleLabel.Layout.Row = 1;
+
+    controls = uigridlayout(root,[2 4]);
+    controls.Layout.Row = 2;
+    controls.RowHeight = {32,32};
+    controls.ColumnWidth = {'1x','1x','1x','1x'};
+    controls.Padding = [0 0 0 0];
+
+    loadBtn = uibutton(controls,'push', ...
+        'Text','Load Audio','FontSize',12, ...
+        'ButtonPushedFcn',@loadAudio);
+    loadBtn.Layout.Row = 1; loadBtn.Layout.Column = 1;
+
+    processBtn = uibutton(controls,'push', ...
+        'Text','Reduce Noise (Hybrid)','FontSize',12, ...
+        'Enable','off','ButtonPushedFcn',@processAudio);
+    processBtn.Layout.Row = 1; processBtn.Layout.Column = 2;
+
+    playOriginalBtn = uibutton(controls,'push', ...
+        'Text','Play Original','FontSize',12, ...
+        'Enable','off','ButtonPushedFcn',@playOriginal);
+    playOriginalBtn.Layout.Row = 1; playOriginalBtn.Layout.Column = 3;
+
+    playCleanBtn = uibutton(controls,'push', ...
+        'Text','Play Noise-Reduced','FontSize',12, ...
+        'Enable','off','ButtonPushedFcn',@playClean);
+    playCleanBtn.Layout.Row = 1; playCleanBtn.Layout.Column = 4;
+
+    stopBtn = uibutton(controls,'push', ...
+        'Text','Stop','FontSize',12, ...
+        'ButtonPushedFcn',@stopPlayback);
+    stopBtn.Layout.Row = 2; stopBtn.Layout.Column = 1;
+
+    saveBtn = uibutton(controls,'push', ...
+        'Text','Save Two WAV Files','FontSize',12, ...
+        'Enable','off','ButtonPushedFcn',@saveOutputs);
+    saveBtn.Layout.Row = 2; saveBtn.Layout.Column = 2;
+
+    strengthLabel = uilabel(controls,'Text','Max Attenuation: 15 dB', ...
+        'HorizontalAlignment','center');
+    strengthLabel.Layout.Row = 2; strengthLabel.Layout.Column = 3;
+
+    strengthSlider = uislider(controls,'Limits',[6 30], ...
+        'Value',15,'MajorTicks',[6 12 18 24 30], ...
+        'ValueChangedFcn',@updateStrength);
+    strengthSlider.Layout.Row = 2; strengthSlider.Layout.Column = 4;
+
+    plots = uigridlayout(root,[2 1]);
+    plots.Layout.Row = 3;
+    plots.RowHeight = {'1x','1x'};
+    plots.Padding = [0 0 0 0];
+
+    axOriginal = uiaxes(plots);
+    title(axOriginal,'Original Audio');
+    xlabel(axOriginal,'Time (seconds)');
+    ylabel(axOriginal,'Amplitude');
+    grid(axOriginal,'on');
+
+    axClean = uiaxes(plots);
+    title(axClean,'Noise-Reduced Audio (Hybrid Output)');
+    xlabel(axClean,'Time (seconds)');
+    ylabel(axClean,'Amplitude');
+    grid(axClean,'on');
+
+    status = uilabel(root,'Text','Load a WAV file to begin.', ...
+        'FontSize',12,'FontColor',[0.15 0.25 0.35]);
+    status.Layout.Row = 4;
+
+    helpLabel = uilabel(root, ...
+        'Text','Pipeline: HPF 80 Hz -> Notch 50/100 Hz -> MCRA noise tracking -> Decision-directed MMSE-LSA gain.  Tip: leave ~0.5 s of silence at the start.', ...
+        'HorizontalAlignment','center','FontSize',10);
+    helpLabel.Layout.Row = 5;
+
+    % ---------- App State ----------
+    original = [];
+    enhanced = [];
+    Fs = [];
+    sourceFolder = pwd;
+    player = [];
+
+    % ---------- Callbacks ----------
+    function loadAudio(~,~)
+        [file,folder] = uigetfile({'*.wav','WAV audio (*.wav)'}, ...
+                                  'Choose noisy/original audio');
+        if isequal(file,0)
+            status.Text = 'Load cancelled. Click Load Audio to try again.';
+            return;
+        end
+
+        try
+            [audio,fs] = audioread(fullfile(folder,file));
+            if size(audio,2)>1
+                audio = mean(audio,2);
+            end
+            audio = audio(:);
+            audio = audio - mean(audio);
+            audio = audio/(max(abs(audio))+eps);
+
+            original = audio;
+            enhanced = [];
+            Fs = fs;
+            sourceFolder = folder;
+            tt = (0:length(original)-1)'/Fs;
+
+            plot(axOriginal,tt,original);
+            title(axOriginal,['Original Audio: ' file],'Interpreter','none');
+            xlabel(axOriginal,'Time (seconds)');
+            ylabel(axOriginal,'Amplitude');
+            grid(axOriginal,'on');
+
+            cla(axClean);
+            title(axClean,'Noise-Reduced Audio');
+            xlabel(axClean,'Time (seconds)');
+            ylabel(axClean,'Amplitude');
+            grid(axClean,'on');
+
+            processBtn.Enable = 'on';
+            playOriginalBtn.Enable = 'on';
+            playCleanBtn.Enable = 'off';
+            saveBtn.Enable = 'off';
+            status.Text = sprintf('Loaded %s | Fs = %d Hz | Duration = %.2f s', ...
+                                  file,Fs,length(original)/Fs);
+        catch ME
+            uialert(fig,ME.message,'Audio Load Error');
+        end
+    end
+
+    function processAudio(~,~)
+        if isempty(original)
+            uialert(fig,'Load a WAV file first.','No Audio');
+            return;
+        end
+        try
+            status.Text = 'Processing: HPF + Notch + MCRA / MMSE-LSA ...';
+            drawnow;
+            maxAtten = strengthSlider.Value;
+
+            t0 = tic;
+            enhanced = denoiseSpeech(original, Fs, maxAtten);
+            tProc = toc(t0);
+
+            if max(abs(enhanced)) > 0
+                enhanced = 0.98 * enhanced / (max(abs(enhanced)) + eps);
+            end
+
+            tt = (0:length(enhanced)-1)'/Fs;
+            plot(axClean, tt, enhanced);
+            title(axClean,'Noise-Reduced Audio (Hybrid Output)');
+            xlabel(axClean,'Time (seconds)');
+            ylabel(axClean,'Amplitude');
+            grid(axClean,'on');
+
+            playCleanBtn.Enable = 'on';
+            saveBtn.Enable = 'on';
+            status.Text = sprintf('Processing complete (%.2f s). Max attenuation = %.0f dB', ...
+                                  tProc, maxAtten);
+        catch ME
+            status.Text = 'Processing failed.';
+            uialert(fig, ME.message, 'Processing Error');
+        end
+    end
+
+    function playOriginal(~,~)
+        if isempty(original), return; end
+        stopPlayback();
+        player = audioplayer(original, Fs);
+        play(player);
+    end
+
+    function playClean(~,~)
+        if isempty(enhanced), return; end
+        stopPlayback();
+        player = audioplayer(enhanced, Fs);
+        play(player);
+    end
+
+    function stopPlayback(~,~)
+        if ~isempty(player)
+            try
+                stop(player);
+            catch
+            end
+            player = [];
+        end
+    end
+
+    function saveOutputs(~,~)
+        if isempty(original) || isempty(enhanced)
+            uialert(fig,'Load audio and run Reduce Noise first.','Nothing to Save');
+            return;
+        end
+        try
+            audiowrite(fullfile(sourceFolder,'original_wav.wav'), original, Fs);
+            audiowrite(fullfile(sourceFolder,'noisy_voice.wav'), enhanced, Fs);
+            status.Text = ['Saved original_wav.wav and noisy_voice.wav to: ' sourceFolder];
+            uialert(fig, sprintf('Saved files successfully to:\n\n%s', sourceFolder), 'Files Saved');
+        catch ME
+            uialert(fig, ME.message, 'Save Error');
+        end
+    end
+
+    function updateStrength(~,~)
+        strengthLabel.Text = sprintf('Max Attenuation: %.0f dB', strengthSlider.Value);
+    end
+end
+
+
+% =====================================================================
+%  DSP CORE  -  everything below maps 1:1 onto the FPGA design
+% =====================================================================
+function y = denoiseSpeech(x, Fs, maxAttenDb)
+% Full enhancement chain. x: column vector (peak-normalised), Fs: its rate.
+
+    % ---- design constants (processing rate = FPGA rate) ----
+    procFs   = 16000;      % Hz  (PDM mic -> CIC -> 16 kHz PCM)
+    hpCutoff = 80;         % Hz  (use ~100 for very heavy traffic rumble)
+    humFreqs = [50 100];   % Hz  mains hum + 1st harmonic (use [60 120] for 60 Hz mains)
+    humQ     = 10;         %     notch Q (about 5 Hz wide at 50 Hz)
+    N   = 512;             % frame length (32 ms @ 16 kHz)
+    hop = 128;             % 75 % overlap
+    K   = N/2 + 1;
+
+    x = x(:);
+    L = numel(x);
+
+    % ---- 0. move to the processing rate ----
+    if Fs ~= procFs
+        xs = resampleTo(x, Fs, procFs);
+    else
+        xs = x;
+    end
+    Lp = numel(xs);
+    if Lp <= 2*N
+        error('Audio too short: need more than %.0f ms.', 2000*N/procFs);
+    end
+
+    % ---- 1. front-end: high-pass + hum notches (biquads) ----
+    [b,a] = biquadHP(hpCutoff, 1/sqrt(2), procFs);
+    xs = filter(b, a, xs);
+    for f0 = humFreqs
+        if f0 < procFs/2
+            [b,a] = biquadNotch(f0, humQ, procFs);
+            xs = filter(b, a, xs);
+        end
+    end
+
+    % ---- 2. STFT (reflection padding keeps the noise tracker fed at the edges) ----
+    pad = N;
+    xp  = [flipud(xs(2:pad+1)); xs; flipud(xs(end-pad-N:end-1))];
+    win = sqrt(0.5 - 0.5*cos(2*pi*(0:N-1)'/N));      % sqrt-Hann (periodic)
+    F   = floor((numel(xp) - N)/hop) + 1;
+    idx = (1:N)' + hop*(0:F-1);                      % N x F sample indices
+    S   = fft(xp(idx) .* win, N, 1);
+    S   = S(1:K, :);                                 % one-sided spectrum
+
+    % ---- 3-5. noise tracking + a-priori SNR + MMSE-LSA gain ----
+    G = computeGain(S, hop, procFs, maxAttenDb);
+
+    % ---- 6. apply gain (noisy phase) and overlap-add ----
+    Sout = G .* S;
+    fr   = real(ifft([Sout; conj(Sout(K-1:-1:2, :))], N, 1)) .* win;
+    out  = zeros(numel(xp), 1);
+    wsum = zeros(numel(xp), 1);
+    w2   = win.^2;
+    for l = 1:F
+        ii = (l-1)*hop + (1:N);
+        out(ii)  = out(ii)  + fr(:, l);
+        wsum(ii) = wsum(ii) + w2;
+    end
+    ok = wsum > 1e-8;
+    out(ok) = out(ok) ./ wsum(ok);
+    out(~ok) = 0;
+    ys = out(pad + (1:Lp));
+
+    % ---- back to the file's sample rate ----
+    if Fs ~= procFs
+        y = resampleTo(ys, procFs, Fs);
+    else
+        y = ys;
+    end
+    y = y(:);
+    if numel(y) >= L
+        y = y(1:L);
+    else
+        y = [y; zeros(L - numel(y), 1)];
+    end
+end
+
+
+function [G, pPres] = computeGain(S, hop, Fs, maxAttenDb)
+% Per-bin gain from the noisy STFT S (K x F). Causal: frame l only uses frames <= l.
+
+    % ---- tuning constants ----
+    aS     = 0.7;          % periodogram smoothing (speech-presence detector)
+    Dsec   = 1.5;          % minimum-tracking window (s)
+    delta  = 5;            % S/Smin threshold for "speech present"
+    aP     = 0.3;          % smoothing of the presence indicator
+    aD     = 0.97;         % noise-PSD update smoothing (frozen when speech present)
+    aDD    = 0.98;         % decision-directed smoothing
+    xiMin  = 10^(-15/10);  % a-priori SNR floor (-15 dB)
+    nInit  = 8;            % frames used to initialise the noise PSD
+
+    [K, F] = size(S);
+    pw   = abs(S).^2;                  % periodogram
+    Gmin = 10^(-maxAttenDb/20);        % gain floor
+
+    % (a) smoothed power (3-tap over frequency, recursive over time) and its running minimum
+    pe = [pw(1,:); pw; pw(end,:)];
+    Sf = 0.25*pe(1:K,:) + 0.5*pe(2:K+1,:) + 0.25*pe(3:K+2,:);
+    Ssm = zeros(K, F);
+    Ssm(:,1) = Sf(:,1);
+    for l = 2:F
+        Ssm(:,l) = aS*Ssm(:,l-1) + (1-aS)*Sf(:,l);
+    end
+    D    = max(2, round(Dsec*Fs/hop));
+    Smin = movmin(Ssm, [D-1 0], 2);                  % trailing (causal) window
+    speechInd = (Ssm ./ (Smin + 1e-12)) > delta;     % K x F logical
+
+    % (b) frame loop: noise PSD -> posterior SNR -> decision-directed prior SNR -> gain
+    lam = max(mean(pw(:, 1:min(nInit, F)), 2), 1e-12);
+    G     = ones(K, F);
+    pPres = zeros(K, F);
+    Gprev   = ones(K, 1);
+    gamPrev = ones(K, 1);
+    pPrev   = zeros(K, 1);
+
+    for l = 1:F
+        pl  = aP*pPrev + (1-aP)*double(speechInd(:,l));  % speech-presence probability
+        ad  = aD + (1-aD)*pl;                            % ->1 when speech present (freeze)
+        lam = ad.*lam + (1-ad).*pw(:,l);                 % noise PSD estimate
+
+        gam = min(pw(:,l) ./ (lam + 1e-12), 1000);       % a-posteriori SNR
+        xi  = aDD*(Gprev.^2).*gamPrev + (1-aDD)*max(gam-1, 0);
+        xi  = max(xi, xiMin);                            % a-priori SNR
+
+        v   = max(xi./(1+xi).*gam, 1e-6);
+        Gh1 = min(xi./(1+xi).*exp(0.5*expint(v)), 1);    % MMSE-LSA gain (speech present)
+
+        G(:,l)     = (Gh1.^pl) .* (Gmin.^(1-pl));        % blend with floor by presence prob.
+        pPres(:,l) = pl;
+
+        Gprev = Gh1;  gamPrev = gam;  pPrev = pl;
+    end
+end
+
+
+function [b, a] = biquadHP(f0, Q, Fs)
+% 2nd-order high-pass (RBJ cookbook). Q = 1/sqrt(2) gives a Butterworth response.
+    w0 = 2*pi*f0/Fs;  c = cos(w0);  al = sin(w0)/(2*Q);
+    b = [(1+c)/2, -(1+c), (1+c)/2];
+    a = [1+al, -2*c, 1-al];
+    b = b/a(1);  a = a/a(1);
+end
+
+
+function [b, a] = biquadNotch(f0, Q, Fs)
+% 2nd-order notch (RBJ cookbook).
+    w0 = 2*pi*f0/Fs;  c = cos(w0);  al = sin(w0)/(2*Q);
+    b = [1, -2*c, 1];
+    a = [1+al, -2*c, 1-al];
+    b = b/a(1);  a = a/a(1);
+end
+
+
+function y = resampleTo(x, fsIn, fsOut)
+% Rational resampling. Uses resample() (Signal Processing Toolbox) when available;
+% otherwise falls back to linear interpolation (fine for testing, aliases if downsampling).
+    if exist('resample', 'file') == 2
+        [p, q] = rat(fsOut/fsIn, 1e-9);
+        y = resample(x, p, q);
+    else
+        n  = numel(x);
+        t  = (0:n-1)' / fsIn;
+        tn = (0:round(n*fsOut/fsIn)-1)' / fsOut;
+        y  = interp1(t, x, tn, 'linear', 0);
+    end
+    y = y(:);
+end

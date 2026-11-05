@@ -1,0 +1,39 @@
+## ============================================================
+## Nexys A7 Real-Time Audio DSP  -  constraints
+## Top module: nexys_audio_top
+## ============================================================
+
+## 1. System clock: 100 MHz
+set_property -dict {PACKAGE_PIN E3 IOSTANDARD LVCMOS33} [get_ports {clk_100mhz}]
+create_clock -name sys_clk_pin -period 10.000 -waveform {0.000 5.000} [get_ports {clk_100mhz}]
+
+## 2. Active-low CPU reset button
+set_property -dict {PACKAGE_PIN C12 IOSTANDARD LVCMOS33} [get_ports {rst_btn_n}]
+
+## 3. Slide switches SW[3:0] = noise-gate threshold (0 = gate off)
+set_property -dict {PACKAGE_PIN J15 IOSTANDARD LVCMOS33} [get_ports {sw[0]}]
+set_property -dict {PACKAGE_PIN L16 IOSTANDARD LVCMOS33} [get_ports {sw[1]}]
+set_property -dict {PACKAGE_PIN M13 IOSTANDARD LVCMOS33} [get_ports {sw[2]}]
+set_property -dict {PACKAGE_PIN R15 IOSTANDARD LVCMOS33} [get_ports {sw[3]}]
+
+## 4. Onboard ADMP421 PDM microphone
+set_property -dict {PACKAGE_PIN J5 IOSTANDARD LVCMOS33} [get_ports {m_clk}]
+set_property -dict {PACKAGE_PIN H5 IOSTANDARD LVCMOS33} [get_ports {m_data}]
+set_property -dict {PACKAGE_PIN F5 IOSTANDARD LVCMOS33} [get_ports {m_lrsel}]
+
+## 5. Mono audio output (3.5 mm jack) and amplifier enable
+##    AUD_PWM is open-drain style: the design drives 0 or high-Z; the board
+##    has the pull-up and the 4th-order output filter.
+set_property -dict {PACKAGE_PIN A11 IOSTANDARD LVCMOS33} [get_ports {AUD_PWM}]
+set_property -dict {PACKAGE_PIN D12 IOSTANDARD LVCMOS33} [get_ports {AUD_SD}]
+
+## 6. Asynchronous inputs: they are re-synchronised inside the design
+##    (2-flop synchronisers), so exclude them from timing analysis.
+set_false_path -from [get_ports {rst_btn_n}]
+set_false_path -from [get_ports {sw[*]}]
+set_false_path -from [get_ports {m_data}]
+
+## 7. Bitstream configuration
+set_property BITSTREAM.GENERAL.COMPRESS TRUE [current_design]
+set_property CFGBVS VCCO [current_design]
+set_property CONFIG_VOLTAGE 3.3 [current_design]
